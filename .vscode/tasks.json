@@ -1,7 +1,8 @@
 {
   "version": "2.0.0",
-  // 说明：本机 PowerShell 执行策略为 Restricted，*.ps1 包装脚本（dsh.ps1 / npm.ps1）无法直接运行，
-  // 因此这里统一用 .cmd 入口，保证任务在任意终端里都能跑起来。
+  // 说明：本机执行策略已修为 CurrentUser=RemoteSigned，.ps1 包装脚本可以运行。
+  // 这里仍统一使用 .cmd 入口：它在 cmd / PowerShell / Git Bash 下行为一致，
+  // 不依赖执行策略，也不会被以后策略被重置影响。
   "tasks": [
     {
       "label": "DSH: 启动 Web GUI",
