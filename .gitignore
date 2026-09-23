@@ -1,0 +1,58 @@
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 编辑器 / IDE ----
+# 保留 .vscode/ 里的共享配置（settings/tasks/launch/extensions）
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+
+# ---- 密钥与本地配置（绝对不要提交）----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.credentials.yaml
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- DSH 运行产物 ----
+.dsh/
+dsh-sessions/
+*.dsh-log
+
+# ---- 临时文件 ----
+tmp/
+temp/
+*.tmp
+*.log

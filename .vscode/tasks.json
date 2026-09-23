@@ -1,0 +1,68 @@
+{
+  "version": "2.0.0",
+  // 说明：本机 PowerShell 执行策略为 Restricted，*.ps1 包装脚本（dsh.ps1 / npm.ps1）无法直接运行，
+  // 因此这里统一用 .cmd 入口，保证任务在任意终端里都能跑起来。
+  "tasks": [
+    {
+      "label": "DSH: 启动 Web GUI",
+      "type": "shell",
+      "command": "dsh.cmd",
+      "args": ["web"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "DSH: 在本目录开一个会话",
+      "type": "shell",
+      "command": "dsh.cmd",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "Git: 查看当前状态",
+      "type": "shell",
+      "command": "git",
+      "args": ["status", "--short", "--branch"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Git: 暂存全部改动并提交",
+      "type": "shell",
+      "command": "git",
+      "args": ["commit", "-a", "-m", "${input:commitMessage}"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "Git: 拉取（--ff-only）",
+      "type": "shell",
+      "command": "git",
+      "args": ["pull", "--ff-only"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "Git: 推送",
+      "type": "shell",
+      "command": "git",
+      "args": ["push"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "commitMessage",
+      "type": "promptString",
+      "description": "提交信息",
+      "default": "chore: update"
+    }
+  ]
+}

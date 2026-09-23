@@ -1,0 +1,49 @@
+{
+  // 与 Git 协作相关的编辑器行为
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+  "git.postCommitCommand": "none",
+  "git.showActionButton": {
+    "commit": true,
+    "publish": true,
+    "sync": true
+  },
+  "scm.inputFontSize": 13,
+  "diffEditor.ignoreTrimWhitespace": false,
+
+  // 文件与缩进规范（统一为 LF + 2 空格，和 .gitattributes 对齐）
+  "files.eol": "\n",
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.encoding": "utf8",
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "editor.formatOnSave": true,
+  "editor.rulers": [100],
+
+  // 隐藏噪音目录，让资源管理器聚焦源码
+  "files.exclude": {
+    "**/.git": true,
+    "**/node_modules": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/coverage": true,
+    "**/pnpm-lock.yaml": false
+  },
+
+  // 终端：Windows 上默认用 PowerShell，UTF-8 输出避免中文乱码
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "terminal.integrated.env.windows": {
+    "PYTHONIOENCODING": "utf-8"
+  }
+}
