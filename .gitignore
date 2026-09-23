@@ -56,3 +56,7 @@ tmp/
 temp/
 *.tmp
 *.log
+
+# ---- 本地一次性脚本（不提交）----
+.setup/
+install-gh.bat
