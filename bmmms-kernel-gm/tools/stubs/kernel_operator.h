@@ -225,5 +225,7 @@ aclError aclrtMalloc(void **, size_t, int);
 aclError aclrtMemset(void *, size_t, int, size_t);
 aclError aclrtFree(void *);
 aclError aclrtSynchronizeStreamWithTimeout(aclrtStream, int);
+#define ACL_MEMCPY_DEVICE_TO_DEVICE 3
+aclError aclrtMemcpy(void *, size_t, const void *, size_t, int);
 
 #endif // ASCEND_STUB_H
