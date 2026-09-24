@@ -1,141 +1,130 @@
-# bmmms-kernel-gm —— 少穿 GM + 把 512KiB L1 用起来
+# bmmms-kernel-gm —— 把 AIV↔AIC 的**握手次数**打到下限
 
-**交付物：`kernel.asc`**。基线是队友 push 的最新 `kernel.asc`（真机 15/15）。本版在
-**不改数学语义、不改任务划分、不改输出写回方式**的前提下，继续压 AIV/AIC 之间的 GM 往返，
-并按「L1 = 512KiB」这条已知事实把 AIC 侧的操作数复用打开。
+**交付物：`kernel.asc`**。基线是队友 push 的最新 `kernel.asc`（真机 15/15）。本版不改数学
+语义、不改任务划分、不改输出写回方式，只改**搬运与调用的组织方式**。
 
 | 项 | 值 |
 | --- | --- |
 | 基线 | `origin/main` @ `f5b3995`，`kernel.asc` blob `3e96fd39`（真机 **15/15**） |
 | 基线副本 | `teammate-latest.asc`（同目录，逐字节 = `git show origin/main:.../kernel.asc`） |
-| 本版 | `kernel.asc`：分片 128×128（方阵、dbL0C=2）+ AtomicMax 就地归并 + **M 窗口** |
+| 本版 | `kernel.asc`：**`IterateAll` 一次算完一个行块** + 大块读回 + 两级归约 |
 | 提交方式 | 覆盖 `npu-v1/project/kernel.asc`（判题侧唯一 `editable: true` 的文件） |
 
-## 一、这一版相对上一版的三处变化
+## 一、为什么"没有变快"——上一版的诊断
 
-1. **分片回到方阵 `128×128`（16384 元素、64KB、`dbL0C = 2`）**，丢弃"L0C 满存"的
-   `128×256`（`dbL0C = 1`）。理由：AIC 从 GM 取操作数的量是
-   `(n/baseN)·m·k·2 + (m/baseM)·n·k·2`，在 `baseM·baseN ≤ L0C/4` 的约束下，
-   这个和由 **AM-GM 在 `baseM ≈ baseN` 处最小**；而 `dbL0C = 1` 会让 Mmad 与 Fixpipe
-   无法重叠。方阵同时把 L0C 留出双缓冲。
-2. **新增 M 窗口**：一次 `SetSingleShape + SetTensorA/B` 覆盖**最多 4 个行块（512 行）**，
-   分片按 `mBlk = tileIdx % windowBlocks` 路由到各行块自己的归并区，AIV 在**窗口末尾**
-   逐行块读回一次（每个行块仍是 1 次读，只是不再与 AIC 逐片握手）。目的见第三节。
-3. **保留上一版的 abort 修复**（这不是可选项）：分片请求阶梯的最后一档 = 基线配置、
-   回读校验只留必要上界、内部同步超时 3s→60s。理由见第六节（真机上 abort 会被
-   `ReplayOnce` 重放，直接违反"一次迭代一个 kernel"）。
+上一版（128×128 分片 + AtomicMax 就地归并 + M 窗口）确实把**分片数**降下来了
+（4096² 从 4096 片降到 1024 片），但**每片仍然要一次 `while (mm.Iterate()) { GetTensorC }`**：
+即每片一次 AIV↔AIC 握手 + 一次同步等待。分片大了 4 倍，握手次数只降 4 倍，
+而握手本身的**延迟**基本不变 —— 所以看起来"只快了一点"。
 
-## 二、为什么"穿 GM"绕不开
+**真正的杠杆是把"每片一次握手"换成"每行块一次"**：
 
-`910D_knowledge_extra/220x到351x架构变更.md:120-165` 把「**新增 L0C Buffer 到 UB 的
-单向数据通路**」列为 **351x 的新增能力**。本题实测架构是 **220x（DAV_2201）**，没有它 ——
-每块 C 分片只能 `Fixpipe: L0C→GM` 再 `MTE2: GM→UB`。
+```cpp
+mm.SetSingleShape(validM, shape.n, shape.k);
+mm.SetTensorA(...); mm.SetTensorB(...);
+mm.IterateAll(cStage, /*enAtomic=*/0, /*enSequentialWrite=*/true);   // ← 一个行块只有这一次
+```
 
-## 三、L1 = 512KiB 到底能用在哪里（本版核心）
+文档依据（`IterateAll.md:20-70`）："调用一次IterateAll，会计算出
+singleCoreM * singleCoreN大小的C矩阵"、**默认同步**（"需要同步等待IterateAll执行结束"）、
+A2/A3 支持，示例就是 `REGIST_MATMUL_OBJ + SetTensorA/B + IterateAll(gm_c)` —— 与本文件同构。
+约束只有一条：C 的地址空间 ≥ `singleCoreM * singleCoreN`（我们用 staging 满足）。
 
-L1 是 **AIC 的操作数缓冲**（A1/B1）。文档把它的用法写得很具体
-（`Matmul_Tiling侧接口/Matmul_Tiling类/TCubeTiling结构体.md`）：
+## 二、三次改版的握手/搬运账（单 batch，4096×4096，baseM=baseN=128）
 
-- `:18-19`　`depthA1` = A1 里全载 `baseM×baseK` 的份数；`stepM` = A1 缓存的 **M 方向
-  baseM 的倍数**（`stepN` 同理是 B 方向的）；
-- `:48`　`AL1Size + BL1Size ≤ L1_size`，其中 `AL1Size = baseM·baseK·depthA1·2`、
-  `BL1Size = baseN·baseK·depthB1·2`，且 `depthA1 = stepM·stepKa·db`、`depthB1 = stepN·stepKb·db`
-  ⇒ **512KiB 这个数字直接决定 `stepM/stepN/stepKa/stepKb` 能开多大**；
-- `:55`　**"Ka 不全载时，即 Ka/baseK > stepKa，stepM = 1"** ⇒ 想跨 M 行块复用 B 面板，
-  前提是整个 K 的 A 面板能装进 L1。
-
-推论（本版据此做的三件事）：
-
-| 手段 | 依据 | 效果 |
-| --- | --- | --- |
-| 给足**单核 M**（窗口 512 行） | `:55` + `stepM` 的定义 | 框架才有机会让 `stepM > 1`（K 装得下时 B 面板复用 `stepM` 倍），同时 `depthA1/stepKa` 能把 K 方向多级缓冲铺到 512KiB，减少停等 |
-| 分片取**方阵** | `AL1Size/BL1Size` 与操作数流量公式 | 操作数流量在 `baseM≈baseN` 最小；`dbL0C=2` 让 Mmad/Fixpipe 重叠 |
-| `SetBufferSpace(-1,-1,-1)` 保持不变 | `SetBufferSpace.md`：`-1` = 用处理器实际 L1/L0C/UB 大小 | 框架本来就知道 512KiB，不需要（也不该）手工塞常数 |
-
-⚠ **诚实边界**：`stepM > 1` 要求整个 K 的 A 面板进 L1（`:55`）。K 很大时（例如 k=4096、
-`baseM=128`：A 面板 1MB ≫ 512KB）这条**不成立**，框架只能 `stepM = 1`。此时窗口带来的
-收益就只剩"K 方向多级缓冲铺得更满 → 少停等"，**B 面板仍会按 `m/baseM` 次重读**。
-要判断到底吃到了哪一档，上板打印 `stepM/stepN/depthA1/depthB1`（见 `kernel.asc` 末尾 VERIFY 4）。
-
-## 四、GM 账（单 batch）
-
-**AIV↔AIC 之间（C 分片）**：一次"写" = Fixpipe 落一块 `[baseM,baseN]`；一次"读" = AIV 搬回一块。
-
-| shape (M×N) | 基线 写+读 | 本版 写+读 | 倍数 |
+| 版本 | AIV↔AIC 同步次数 | Fixpipe 写片数 | AIV 读回次数 |
 | --- | --- | --- | --- |
-| 512×512 | 64 + 64 = 128 | 16 + 4 = 20 | **6.4×** |
-| 1000×1000（尾块 104） | 252 + 252 = 504 | 64 + 16 = 80 | **6.3×** |
-| 4096×4096 | 4096 + 4096 = 8192 | 1024 + 32 = 1056 | **7.8×** |
-| 512×8192 | 1024 + 1024 = 2048 | 256 + 4 = 260 | **7.9×** |
+| 队友基线（16×256，每片握手+每片读） | 4096 | 4096（16KB/片） | 4096（16KB/次） |
+| 上一版（128×128 + AtomicMax 归并 + M 窗口） | **1024** | 1024（64KB/片） | 32（64KB/次） |
+| **本版（IterateAll + 大块读）** | **32** | 1024（64KB/片） | **512**（128KB/次，2 片一读） |
 
-（基线按 `baseM=16`、`baseN=min(256, align16(n))` 计；本版按 `128×128` 计。
-基线 `baseN` 的真机实际值日志里没有 —— `bmmms-kernel-fix/DIAGNOSIS.md` 未验证项 V1 ——
-若它更小，基线分片数更多、倍数只会更大。）
+握手次数 4096 → 32（**128×**）。既然原来的瓶颈是"每片一次握手 + 同步等待"，
+这一项就是本版要吃的收益；单次握手按基线结构估算在 µs 量级，乘以 4096 就是原来那几毫秒。
+**这是估算，不是实测** —— 本机没有 CANN/NPU，无法给真机数字。
 
-**AIC 操作数（GM→L1，这才是 GM 上的大头）**：
-`A: (n/baseN)·m·k·2` + `B: (m/baseM)·n·k·2`。以 4096³ 为例，`128×128` 分片、
-`stepM=stepN=1` 时是 `1.07GB + 1.07GB ≈ 2.1GB`；**每次 C 分片的 GM 写只有 64KB**，
-所以操作数流量比 C 侧大 30 倍 —— 这也是本版把力气花在窗口/L1 上的原因。
+顺带的取舍（都写进 VERIFY）：
 
-**GM 槽位**：每 worker `2 半 × 4 行块 × 128×128 × 4B = 512KiB`，总 `3·blocks·512KiB`
-（blocks=24 时 36MB）。
+- 读回从"归并缓冲 1 次 64KB"变成"每行块 ceil(n/baseN/2) 次 128KB"：**读次数变多、每次更大**
+  （UB 一次铺满），总读字节数从 2MB/batch 升到 64MB/batch —— 相比 AIC 侧操作数流量
+  （同 shape 约 2GB）可以忽略，而它换来的是握手次数两个数量级的下降。
+- **不再用 AtomicMax**（`enAtomic=2`）：上一版唯一的"无真机先例"组合，本版换成
+  "跨分片只做 Max"，语义更弱、更容易验证。
+- 每个 worker 需要一块 staging：`baseM × n × 4B`（n=8192 时 4MB/worker），
+  总 `min(b, 2*blocks)` 块。
 
-## 五、为什么正确性不受影响
+## 三、本版的搬运/归约组织（"合理分配存储空间和调用顺序"）
 
-1. **max 可交换可结合** ⇒ AtomicMax 的合并顺序无关，结果**逐位确定**（题面要求多次执行一致）。
-2. **路由解码有文档依据**：`Iterate.md:21` 明确"默认以先 **M 轴**再 N 轴的迭代顺序"，
-   `TCubeTiling` 里 `iterateOrder=0` 也是"先往 M 轴方向偏移再往 N 轴" ⇒
-   `mBlk = tileIdx % mBlocks`、`nBlk = tileIdx / mBlocks`。**并且做了双保险**：
-   host 侧只有 `tiling.iterateOrder == 0`（或窗口退化成 1 个行块）时才启用多行块窗口，
-   否则自动退成单行块（解码无歧义）。本地 Oracle 有专门的 `order_n` 反向验证。
-3. **归并区初值**：每个行块的第 0 个 N 分片（`nBlk == 0`）用普通写；原子操作不清零
-   （`SetAtomicAdd.md:47`），而 M 优先顺序保证它一定先到。
-4. **N 尾块不参与归并**：连续写在尾块按 `validN` 紧凑打包，平坦下标与整块不同构
-   （`123b2b8` 的实测结论），混进去会跨行串列 —— 尾块落独立区，走基线已实测的标量逐行读法。
-5. **不信任 tiler**：回读校验 `baseM ≤ 128`、`baseN ≤ 128`、`baseN % 8 == 0` 三条必要条件；
-   请求阶梯全部由 `SetFixSplit/GetTiling` 的返回值驱动，最后一档是基线配置 ⇒ 不会因为
-   分片/窗口请求而 abort。
+```
+每个 batch（属主 AIV 独占）：
+  for 每个行块 (baseM 行)：
+      IterateAll(cStage, 0, true)        ← 1 次同步；连续写把 ceil(n/baseN) 个分片
+                                           按 [validM, baseN] 依次铺在 staging 里
+      while (还有整片)：
+          DataCopyPad 读 READ_TILES=2 片   ← rows=2*validM 行、每行 baseN 个 float，
+                                            128KB，一次把 UB 铺满
+          第一级：逐"列组"WholeReduceMax    ← 每 64 列一组（余列单独一组），
+                                            行距 = baseN/8 个 datablock，结果连续落 groupMax
+          第二级：元素级 Max 折各列组        ← 组值之间隔 8 个 float，只能靠 Max 折，
+                                            用归约的连续 mask 会读到别的行（本地复算抓到过）
+          按分片把行最大值 Max 进行最大值向量 ← 跨 N 取 max，与分片顺序无关
+      N 尾块：紧凑布局（行距 = validN），逐行标量读（沿用 15/15 已验证的读法）
+      行和 → batchSum（只在 row < validM 上）
+  y[batch] = batchSum
+```
 
-## 六、上一版被拒的根因（本版保留的修复）
+存储分配（都用满/留足余量）：
 
-真机回报 `Expected 75 launches, got 110` ⇒ **`110 = 75 + 35 = 75 + 7×5`：约 7 个 case
-每轮都 abort，每次 abort 被 `<ReplayOnce>` 重放、多算一个 launch**。三条自伤逻辑已修：
-
-| # | 缺陷 | 修法 |
+| 存储 | 用法 | 占用 |
 | --- | --- | --- |
-| 1 | 分片阶梯下限写死 64 ⇒ `n < 64` 的 case 一档都试不成 → `Fail()` | 阶梯退到 **8**，并加**基线(16, splitN) 兜底档** |
-| 2 | 回读校验要求 `baseM ≥ min(splitM, m)` ⇒ tiler 合法收敛也被判死 | 只留必要上界 |
-| 3 | `aclrtSynchronizeStreamWithTimeout(stream, 3000)` ⇒ 任一大 case 超 3s 即 abort | 提到 **60s**（判题有自己的 TLE） |
+| L0C 128KB | 分片 `128×128×4 = 64KB` ⇒ `dbL0C = 2`（Mmad 与 Fixpipe 可重叠） | 100%（含双缓冲） |
+| L1 512KB | 框架自己按 `stepM/stepN/stepKa/depthA1` 铺（`TCubeTiling结构体.md:18-19,48`）；本版给的形状让 `stepN` 最多可到 `n/baseN` | 框架支配 |
+| UB 192KB | `cUb` 2 片 = 128KB（一次读满） + `groupMax` 3×256×4 = 3KB + 3 个小缓冲 | ≈ 136KB |
+| GM staging | 每 worker `baseM×n×4`（n=8192 → 4MB），块数 = `min(b, 2*blocks)` | b=1 时 4MB；b=48 时 192MB |
 
-修复后 abort 面 = **基线原有的 7 处 + 2 处构造上不可达的兜底**；本地 `launch_check.py` 守
-"启动点互斥、无同块并联"（本版 6 处启动点，与基线同为互斥的 2 小 + 4 转置分支）。
+## 四、为什么正确性不受影响
 
-## 七、本地验证（都重跑过）
+1. **跨分片只做 Max**（max 可交换可结合）⇒ 与分片产出顺序**完全无关**；
+   单核 M = `validM ≤ baseM` ⇒ 一个行块内只有一个 M 块，连迭代顺序都不用关心。
+2. **N 尾块**：连续写在尾片按 `validN` 紧凑打包、行首不保证 32B 对齐，
+   所以走基线已实测的标量逐行读法（`123b2b8` 的结论）。
+3. **两级归约对任意 baseN 都对**：完整 64 列组 + 余列组（余列 `mask` 为该组列数、
+   `srcRepStride = baseN/8`），第二级用元素级 `Max` 折组 —— 与 baseN 是不是 64 的倍数无关。
+4. **行和只在 `row < validM` 上做**，最后每 batch 只写一个 float。
+5. **不信任 tiler**：回读校验只有三条必要条件（`baseM ≤ 128`、`baseN ≤ 128`、`baseN % 8 == 0`）；
+   请求阶梯全部由 `SetFixSplit/GetTiling` 返回值驱动，末档 = 基线配置 ⇒ 不会因分片请求 abort。
+
+## 五、上一版被拒的根因（本版保留的修复）
+
+真机回报 `Expected 75 launches, got 110` ⇒ **`110 = 75 + 7×5`：约 7 个 case 每轮都 abort，
+每次 abort 被 `<ReplayOnce>` 重放、多算一个 launch**。三条自伤逻辑已修：
+分片阶梯下限 64→**8**、回读校验删掉多余的 `baseM ≥ min(splitM,m)`、
+内部同步超时 3s→**60s**。修复后 abort 面 = 基线原有 7 处 + 2 处构造上不可达的兜底。
+
+## 六、本地验证（都重跑过）
 
 | 门禁 | 结果 |
 | --- | --- |
-| `tools/launch_check.py` | **通过**：6 处启动点全在互斥分支、无同块并联；列出全部 `Fail()` 复核点 |
-| `tools/reduce_oracle_gm.py` | **20 组 shape × 5 档配置**（窗口 1/2/4 × 方阵分片，以及兜底 `16×N` × 窗口 1/4）与 golden **逐位一致**；反向 5 个变体（尾块混入归并、行和多算残留、关掉 AtomicMax、漏尾块、**迭代顺序误判**）**全部被检出** |
-| `tools/syntax_check.py` | 基线 ok / 本版 **ok**（本版比基线少一个 warning） |
-| `tools/api_delta.py` | 相对基线只多 3 个 API：`WholeReduceMax`、`SetAtomicNone`、`HardEvent::V_MTE2`；少了 `ReduceMax` |
+| `tools/launch_check.py` | 通过：6 处启动点全在互斥分支、无同块并联；列出全部 `Fail()` 复核点 |
+| `tools/reduce_oracle_gm.py` | **25 组 shape × 2 档配置**（方阵档 + 基线 `16×N` 兜底档）与 golden **逐位一致**（含 `baseN<64`、`baseN` 非 64 倍数、`n<baseN`、`m%baseM!=0`、`n=8192`）；反向 5 个变体**全部检出**：分片步进按补齐尺寸、尾片行距误用 baseN、漏尾片、行和多算残留、**折叠方式用错** |
+| `tools/syntax_check.py` | 基线 ok / 本版 ok（本版比基线少一个 warning） |
+| `tools/api_delta.py` | 新用 `IterateAll`、`WholeReduceMax`、`HardEvent::V_MTE2`；不再用 `Iterate`/`GetTensorC`/`ReduceMax` |
 
-**没有做（本机做不到）**：真机编译、上板精度、真机用时、AtomicMax 的硬件行为、
-tiler 是否真的把 512KiB L1 用起来（`stepM/stepN/depth*` 的实际值）。
+**没有做（本机做不到）**：真机编译、上板精度、真机用时、`IterateAll` 在 MIX kernel 里的实际行为、
+连续写的分片步进到底按有效尺寸还是补齐尺寸。
 
-## 八、上板必查（详细版在 `kernel.asc` 末尾 VERIFY，共 10 条）
+## 七、上板必查（详细版在 `kernel.asc` 末尾 VERIFY，共 10 条）
 
 0. 日志里**是否还有 `<ReplayOnce>` / `status 134` / launch 数超标**；若再次超标，
    把新的差值给我（`差值 ÷ 迭代次数 = 出问题的 case 数`）。
-1. **AtomicMax 是否生效**（`enAtomic=2` + `enSequentialWrite=true`，无真机先例）。
-   失败特征：**所有 case 结果偏小**（只剩最后一个 N 分片）。退路：`teammate-latest.asc`。
-2. **打印 `baseM/baseN/iterateOrder/stepM/stepN/depthA1/depthB1`** —— 这五个数决定
-   L1 到底吃到了多少（第 3 节）。
-3. `WholeReduceMax` 的行距/顺序参数（mask=64、repeat=validM、srcRepStride=baseN/8、
-   ORDER_ONLY_VALUE）；失败特征：行最大值取到别的行。
-4. UB 67.6KB / 192KB、GM 槽位 36MB 是否都分配成功。
-5. 同输入两次执行是否逐位一致（题面要求；AtomicMax 理论上保证）。
+1. **`IterateAll` 能不能用**（编译期就能看出来：编译过了就说明重载被接受）。
+2. **只有 `m % baseM != 0` 的 case 错** ⇒ 连续写的步进是**补齐尺寸**而不是有效尺寸：
+   把 kernel 里两处 `validM * baseN`（片偏移、`cStage` 片基址）改成 `baseM * baseN` 即可。
+3. **两级归约参数**（`mask=min(64, 余列)`、`srcRepStride=baseN/8`；第二级用元素级 Max）。
+   失败特征：行最大值取到别的行/别的组。
+4. 打印 `baseM/baseN/depthA1/depthB1/stepN`，确认框架把 512KiB L1 用起来了。
+5. UB 136KB / 192KB、staging 分配成功与否。
 
-## 九、文件
+## 八、文件
 
 | 文件 | 说明 |
 | --- | --- |
@@ -143,7 +132,7 @@ tiler 是否真的把 512KiB L1 用起来（`stepM/stepN/depth*` 的实际值）
 | `teammate-latest.asc` | 基线原文（真机 15/15）—— 退路 |
 | `tools/launch_check.py` | 判题硬规则门禁（单 kernel / 无同块并联 / 列出 Fail 点） |
 | `tools/syntax_check.py` + `tools/stubs/` | 语法门禁 |
-| `tools/reduce_oracle_gm.py` | 搬运/路由/归约的离线逐位复算 + 反向验证 |
+| `tools/reduce_oracle_gm.py` | 搬运/归约的离线逐位复算 + 反向验证 |
 | `tools/api_delta.py` | 相对基线的 API 差集 |
 
 ```bash

@@ -1,0 +1,727 @@
+// ============================================================================
+// Cube Matmul + Vector MaxSim
+// ============================================================================
+//
+// 本版目标：把 AIV 与 AIC 之间的**同步次数**和 GM 往返都压到平台允许的下限。
+//
+// 平台事实（`910D_knowledge_extra/220x到351x架构变更.md:120-165`）：L0C→UB 直通是
+// **351x 才新增**的通路；本题实测架构是 220x（DAV_2201），没有它 —— 每块 C 分片
+// 只能由 Fixpipe 写一次 GM、再由 AIV 读回来，这条路径绕不开。
+//
+// 那剩下的杠杆就是**别一片一片地握手**：
+//
+//   [1] `mm.IterateAll(cStage, 0, /*enSequentialWrite=*/true)`
+//       —— 文档（`IterateAll.md:20-70`）："调用一次IterateAll，会计算出
+//       singleCoreM * singleCoreN大小的C矩阵"，**默认同步**（`sync = true`，
+//       "需要同步等待IterateAll执行结束"），A2/A3 支持，且示例就是
+//       `REGIST_MATMUL_OBJ + SetTensorA/B + IterateAll(gm_c)` —— 与本文件同构。
+//       ⇒ 一个行块只**握手 1 次**。旧写法 `while (mm.Iterate()) { GetTensorC(...) }`
+//         是每个 N 分片握手一次：m=4096/n=4096 时 每 batch 1024 次 → 现在 32 次。
+//         这是本版相对"每片 GetTensorC"版本的**唯一关键差别**，也是它快的原因。
+//
+//   [2] 连续写把同一行块的 N 个分片**顺序紧挨着**铺在 staging 里（每片 [validM, baseN]，
+//       尾片 [validM, tailN]），于是 AIV 可以用**大块搬运**读回来：
+//       一次 `DataCopyPad` 读 READ_TILES 片（2×128×128×4 = 128KB，把 UB 铺满），
+//       而不是每片一次 64KB。读回来后按分片做两级 WholeReduceMax（见下）。
+//
+//   [3] 归约改成"两级 + 按行合并"，全程无原子、与分片顺序无关：
+//       第一级：每 64 列一组求最大值，`dstRepStride = 8` 把结果按 32B 对齐排布；
+//       第二级：把每行的 baseN/64 个组折成 1 个（`srcRepStride = baseN/64` 个 datablock）；
+//       然后把每个分片的行最大值 Max 进行最大值向量（只有跨 N 的 max，与顺序无关）。
+//       ⇒ 不再需要 AtomicMax（那是上一版的唯一未验证组合），也不需要按分片下标路由。
+//
+// 为什么正确性不受影响：
+//   * 行最大值 = max over N：分片之间只做 Max，与产出顺序无关。
+//   * N 尾块（n % baseN != 0）单独读：连续写在尾片按 validN 紧凑打包，行距是 validN、
+//     行首不再 32B 对齐 —— 沿用 15/15 版本验证过的标量逐行读法（123b2b8 的结论）。
+//   * 行和只在 row < validM 上做，最后每 batch 只写一个 float 到 y[batch]。
+// ============================================================================
+
+template <
+    typename InputT,
+    bool TRANSPOSE_A,
+    bool TRANSPOSE_B>
+__global__ __aicore__ void MatmulMaxKernel(
+    GM_ADDR x1,
+    GM_ADDR x2,
+    GM_ADDR y,
+    __kfc_workspace__ GM_ADDR systemWorkspace,
+    GM_ADDR cWorkspace,
+    CubeTiling tiling,
+    Shape shape,
+    uint32_t workerCount)
+{
+    TPipe pipe;
+
+
+    using AType =
+        MatmulType<
+            TPosition::GM,
+            CubeFormat::ND,
+            InputT,
+            TRANSPOSE_A>;
+
+
+    using BType =
+        MatmulType<
+            TPosition::GM,
+            CubeFormat::ND,
+            InputT,
+            TRANSPOSE_B>;
+
+
+    using CType =
+        MatmulType<
+            TPosition::GM,
+            CubeFormat::ND,
+            float>;
+
+
+    Matmul<
+        AType,
+        BType,
+        CType> mm;
+
+
+    REGIST_MATMUL_OBJ(
+        &pipe,
+        GetSysWorkSpacePtr(),
+        mm,
+        &tiling);
+
+
+    /*
+     * 编译期上限：UB 缓冲全部按 MAX_* 分配，实际几何取自 tiling 回读值
+     * （host 侧已校验回读值不超上限）。
+     */
+    static constexpr uint32_t
+        PASS_STRIDE =
+            8U;
+
+    static constexpr uint32_t
+        GROUP_MAX =
+            MAX_TILE_N /
+            64U;
+
+    static constexpr uint32_t
+        PASS_MAX_ELEMS =
+            READ_TILES *
+            MAX_BASE_M *
+            GROUP_MAX *
+            PASS_STRIDE;
+
+
+    TBuf<TPosition::VECCALC> tileBuf;
+    TBuf<TPosition::VECCALC> passBuf;
+    TBuf<TPosition::VECCALC> rowTileBuf;
+    TBuf<TPosition::VECCALC> rowMaxBuf;
+    TBuf<TPosition::VECCALC> tailMaxBuf;
+    TBuf<TPosition::VECCALC> rowOutBuf;
+
+
+    /* 一次读回 READ_TILES 片：2 × 128 × 128 × 4B = 128KB，把 UB 铺满 */
+    pipe.InitBuffer(
+        tileBuf,
+        READ_TILES *
+            MAX_BASE_M *
+            MAX_TILE_N *
+            sizeof(float));
+
+
+    /* 第一级输出：最多 READ_TILES*MAX_BASE_M*GROUP_MAX 个组，每组占 PASS_STRIDE 个 float */
+    pipe.InitBuffer(
+        passBuf,
+        PASS_MAX_ELEMS *
+            sizeof(float));
+
+
+    pipe.InitBuffer(
+        rowTileBuf,
+
+        READ_TILES *
+            MAX_BASE_M *
+            sizeof(float));
+
+
+    pipe.InitBuffer(
+        rowMaxBuf,
+        MAX_BASE_M *
+            sizeof(float));
+
+
+    pipe.InitBuffer(
+        tailMaxBuf,
+        MAX_BASE_M *
+            sizeof(float));
+
+
+    pipe.InitBuffer(
+        rowOutBuf,
+        MAX_BASE_M *
+            sizeof(float));
+
+
+    LocalTensor<float>
+        cUb =
+            tileBuf.Get<float>();
+
+
+    LocalTensor<float>
+        passUb =
+            passBuf.Get<float>();
+
+
+    LocalTensor<float>
+        rowTile =
+            rowTileBuf.Get<float>();
+
+
+    LocalTensor<float>
+        rowMaxVec =
+            rowMaxBuf.Get<float>();
+
+
+    LocalTensor<float>
+        tailMaxVec =
+            tailMaxBuf.Get<float>();
+
+
+    LocalTensor<float>
+        rowOut =
+            rowOutBuf.Get<float>();
+
+
+    /*
+     * tiling 回读值。host 侧已校验：baseM ≤ MAX_BASE_M、baseN ≤ MAX_TILE_N、
+     * baseN % 8 == 0（行距按 datablock 计）。
+     *
+     * singleCoreM 恒 = validM ≤ baseM ⇒ 一个行块内只有 1 个 M 块，产出顺序对本
+     * kernel 完全无所谓（片之间只做 Max）。
+     */
+    const uint32_t baseM =
+        static_cast<uint32_t>(
+            tiling.baseM);
+
+
+    const uint32_t baseN =
+        static_cast<uint32_t>(
+            tiling.baseN);
+
+
+    const uint32_t
+        nFullTiles =
+            shape.n /
+            baseN;
+
+
+    const uint32_t
+        tailN =
+            shape.n -
+            nFullTiles *
+                baseN;
+
+
+    /* 每行的 64 列组数 / 第一级结果的行距（float） */
+    const uint32_t
+        groupsPerRow =
+            baseN /
+            64U;
+
+
+    const uint32_t
+        groupStride =
+            groupsPerRow *
+            PASS_STRIDE;
+
+
+    GlobalTensor<InputT> a;
+    GlobalTensor<InputT> b;
+    GlobalTensor<float> out;
+
+
+    a.SetGlobalBuffer(
+        reinterpret_cast<
+            __gm__ InputT *>(x1),
+
+        static_cast<uint64_t>(
+            shape.b) *
+            shape.m *
+            shape.k);
+
+
+    b.SetGlobalBuffer(
+        reinterpret_cast<
+            __gm__ InputT *>(x2),
+
+        static_cast<uint64_t>(
+            shape.b) *
+            shape.n *
+            shape.k);
+
+
+    out.SetGlobalBuffer(
+        reinterpret_cast<
+            __gm__ float *>(y),
+
+        static_cast<uint64_t>(
+            shape.b));
+
+
+    const uint32_t worker =
+        static_cast<uint32_t>(
+            GetBlockIdx());
+
+
+    /*
+     * task = (batch)：全 worker 里只有 id < b 的会真的读写 cStage（其余 task 循环不进），
+     * 所以槽位数 = min(b, 2*blocks)，槽位下标就用 worker 本身（host 侧同公式申请）。
+     */
+    const uint32_t workers =
+        workerCount;
+
+
+    /*
+     * staging：每个 worker 一块，够放"一个行块的整张 C" ——
+     * 连续写把 ceil(n/baseN) 个分片依次铺开，所以元素数 = validM * n ≤ baseM * n。
+     */
+    GlobalTensor<float> cStage;
+
+
+    cStage.SetGlobalBuffer(
+        reinterpret_cast<
+            __gm__ float *>(cWorkspace) +
+            static_cast<uint64_t>(
+                worker) *
+                static_cast<uint64_t>(
+                    MAX_BASE_M) *
+                shape.n,
+
+        static_cast<uint64_t>(
+            MAX_BASE_M) *
+            shape.n);
+
+
+    /*
+     * 一个 task = 一个 batch：属主 AIV 走完它的所有行块，行和累在寄存器里，
+     * 最后只写一个 float 到 y[batch]。无原子、无跨 worker 累加、无第二阶段。
+     */
+    for (uint32_t task = worker;
+         task < shape.b;
+         task += workers) {
+
+        const uint32_t batch =
+            task;
+
+
+        float batchSum = 0.0f;
+
+
+        for (uint32_t rowStart = 0;
+             rowStart < shape.m;
+             rowStart += baseM) {
+
+        const uint32_t validM =
+            MinU32(
+                baseM,
+                shape.m -
+                    rowStart);
+
+
+        const uint64_t aOffset =
+            static_cast<uint64_t>(
+                batch) *
+                shape.m *
+                shape.k
+            +
+            (
+                TRANSPOSE_A
+                    ?
+                    static_cast<uint64_t>(
+                        rowStart)
+                    :
+                    static_cast<uint64_t>(
+                        rowStart) *
+                        shape.k
+            );
+
+
+        const uint64_t bOffset =
+            static_cast<uint64_t>(
+                batch) *
+                shape.n *
+                shape.k;
+
+
+        Duplicate(
+            rowMaxVec,
+            NEG_INF,
+            static_cast<int32_t>(
+                MAX_BASE_M));
+
+
+        mm.SetOrgShape(
+            shape.m,
+            shape.n,
+            shape.k);
+
+
+        mm.SetSingleShape(
+            validM,
+            shape.n,
+            shape.k);
+
+
+        mm.SetTensorA(
+            a[aOffset],
+            TRANSPOSE_A);
+
+
+        mm.SetTensorB(
+            b[bOffset],
+            TRANSPOSE_B);
+
+
+        /*
+         * 【杠杆 1】一个行块只同步一次：整张 [validM, n] 的 C 由这一次调用算完并搬出。
+         * 连续写把第 t 个 N 分片放在 cStage[t*validM*baseN]（尾片 [validM, tailN]）。
+         */
+        mm.IterateAll(
+            cStage,
+            0U,
+            true);
+
+
+        /*
+         * 【杠杆 2】大块读回 + 【杠杆 3】两级归约，一次处理 READ_TILES 个分片。
+         */
+        uint32_t tileIdx = 0;
+
+
+        while (tileIdx < nFullTiles) {
+
+            const uint32_t tiles =
+                MinU32(
+                    READ_TILES,
+                    nFullTiles -
+                        tileIdx);
+
+
+            const uint32_t rows =
+                tiles *
+                validM;
+
+
+            Fence<
+                HardEvent::V_MTE2>(
+                    pipe);
+
+
+            DataCopyExtParams
+                copyTiles;
+
+            copyTiles.blockCount =
+                static_cast<uint16_t>(
+                    rows);
+
+            copyTiles.blockLen =
+                baseN *
+                sizeof(float);
+
+            copyTiles.srcStride = 0;
+            copyTiles.dstStride = 0;
+            copyTiles.rsv = 0;
+
+
+            DataCopyPadExtParams<float>
+                padTiles;
+
+
+            DataCopyPad(
+                cUb,
+                cStage[
+                    tileIdx *
+                    validM *
+                    baseN
+                ],
+                copyTiles,
+                padTiles);
+
+
+            Fence<
+                HardEvent::MTE2_V>(
+                    pipe);
+
+
+            /*
+             * 第一级：每 64 列一组取最大值。dstRepStride = PASS_STRIDE(8) 把每个组的
+             * 结果落在 8 个 float 的槽里 ⇒ 每个分片每行的组块天然 32B 对齐，
+             * 第二级才可以用 datablock 步长寻址。单次 repeat 上限 255，故分批。
+             */
+            const uint32_t groups =
+                rows *
+                groupsPerRow;
+
+
+            for (uint32_t g = 0;
+                 g < groups;
+                 g += 255U) {
+
+                WholeReduceMax(
+                    passUb[
+                        g *
+                        PASS_STRIDE
+                    ],
+                    cUb[
+                        g *
+                        64U
+                    ],
+                    64,
+                    static_cast<int32_t>(
+                        MinU32(
+                            255U,
+                            groups -
+                                g)),
+                    static_cast<int32_t>(
+                        PASS_STRIDE),
+                    1,
+                    8,
+                    ReduceOrder::
+                        ORDER_ONLY_VALUE);
+            }
+
+
+            /*
+             * 第二级：每个分片的每一行，把 groupsPerRow 个组折成一个最大值。
+             * 源操作数相邻迭代的步长 = 一行的组块 = groupsPerRow 个 datablock。
+             */
+            for (uint32_t r = 0;
+                 r < rows;
+                 r += 255U) {
+
+                WholeReduceMax(
+                    rowTile[
+                        r
+                    ],
+                    passUb[
+                        r *
+                        groupStride
+                    ],
+                    static_cast<int32_t>(
+                        groupsPerRow),
+                    static_cast<int32_t>(
+                        MinU32(
+                            255U,
+                            rows -
+                                r)),
+                    1,
+                    1,
+                    static_cast<int32_t>(
+                        groupsPerRow),
+                    ReduceOrder::
+                        ORDER_ONLY_VALUE);
+            }
+
+
+            /* 分片之间只做 Max（跨 N 取最大），与产出顺序无关 */
+            for (uint32_t j = 0;
+                 j < tiles;
+                 ++j) {
+
+                Max(
+                    rowMaxVec,
+                    rowMaxVec,
+                    rowTile[
+                        j *
+                        validM
+                    ],
+                    static_cast<int32_t>(
+                        validM));
+            }
+
+
+            tileIdx +=
+                tiles;
+        }
+
+
+        /*
+         * N 尾块：连续写在尾片按 validN 紧凑打包，所以行距是 tailN，
+         * 行首不再 32B 对齐 —— 沿用 15/15 版本验证过的标量逐行读法。
+         */
+        if (tailN > 0U) {
+
+            Fence<
+                HardEvent::V_MTE2>(
+                    pipe);
+
+
+            DataCopyExtParams
+                copyTail;
+
+            copyTail.blockCount = 1;
+
+            copyTail.blockLen =
+                validM *
+                tailN *
+                sizeof(float);
+
+            copyTail.srcStride = 0;
+            copyTail.dstStride = 0;
+            copyTail.rsv = 0;
+
+
+            DataCopyPadExtParams<float>
+                padTail;
+
+
+            DataCopyPad(
+                cUb,
+                cStage[
+                    nFullTiles *
+                    validM *
+                    baseN
+                ],
+                copyTail,
+                padTail);
+
+
+            Fence<
+                HardEvent::MTE2_V>(
+                    pipe);
+
+
+            Duplicate(
+                tailMaxVec,
+                NEG_INF,
+                static_cast<int32_t>(
+                    MAX_BASE_M));
+
+
+            Fence<
+                HardEvent::V_S>(
+                    pipe);
+
+
+            for (uint32_t row = 0;
+                 row < validM;
+                 ++row) {
+
+                float rowBest =
+                    NEG_INF;
+
+                const uint32_t srcBase =
+                    row *
+                    tailN;
+
+                for (uint32_t col = 0;
+                     col < tailN;
+                     ++col) {
+
+                    const float v =
+                        cUb.GetValue(
+                            srcBase + col);
+
+                    if (v > rowBest) {
+                        rowBest = v;
+                    }
+                }
+
+
+                tailMaxVec.SetValue(
+                    row,
+                    rowBest);
+            }
+
+
+            Fence<
+                HardEvent::S_V>(
+                    pipe);
+
+
+            Max(
+                rowMaxVec,
+                rowMaxVec,
+                tailMaxVec,
+                static_cast<int32_t>(
+                    validM));
+        }
+
+
+        Fence<
+            HardEvent::V_S>(
+                pipe);
+
+
+        float tileSum = 0.0f;
+
+
+        for (uint32_t row = 0;
+             row < validM;
+             ++row) {
+
+            tileSum +=
+                rowMaxVec
+                    .GetValue(row);
+        }
+
+
+        batchSum += tileSum;
+
+
+        Fence<
+            HardEvent::S_V>(
+                pipe);
+        }
+
+
+        if
+            ASCEND_IS_AIV
+        {
+
+            rowOut.SetValue(
+                0,
+                batchSum);
+
+
+            Fence<
+                HardEvent::S_MTE3>(
+                    pipe);
+
+
+            DataCopyExtParams
+                copyOut;
+
+            copyOut.blockCount = 1;
+
+            copyOut.blockLen =
+                sizeof(float);
+
+            copyOut.srcStride = 0;
+
+            copyOut.dstStride = 0;
+
+            copyOut.rsv = 0;
+
+
+            DataCopyPad(
+                out[
+                    batch
+                ],
+                rowOut,
+                copyOut);
+
+
+            Fence<
+                HardEvent::MTE3_S>(
+                    pipe);
+        }
+    }
+
+
+    mm.End();
+
+
+    PipeBarrier<PIPE_ALL>();
+}
+
+
