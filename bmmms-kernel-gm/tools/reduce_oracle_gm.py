@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """reduce_oracle_gm.py — kernel.asc 的搬运/归约逻辑**离线逐位复算**（含反向验证）
 
-本机没有 CANN、没有 NPU，所以不可能"跑 kernel"。但正确性依赖一串下标与布局推理，
-这些可以逐位复算。模型严格照抄 kernel 里的表达式：
+本机没有 CANN、没有 NPU（队友那台 910C 我们这边也连不上），所以正确性只能这样验：
+把 kernel 里的下标/布局推理**逐字翻译成 numpy**，再与定义（FP64 golden：max over N、
+sum over M、转 fp32）逐位比对。模型严格照抄 kernel 的表达式：
 
   1. 一个行块（validM = min(baseM, m-rowStart) 行）由**一次 IterateAll** 算完；
-  2. **框架**的连续写把第 t 个 N 分片铺在 `stage[t * validM * baseN]`（这是"有效尺寸
-     步进"，依据是 123b2b8 实测的"尾片按 validN 紧凑打包"），尾片紧跟其后；
-  3. AIV **按自己假定的步进**去读（`read_stride`）：假定错了就读到错位的数据
-     —— 反向验证里的 pad_stride 就是模拟"假定成补齐尺寸"；
-  4. 一次读 READ_TILES 片：`rows = tiles*validM` 行、每行 baseN 个 float；
-  5. 第一级 WholeReduceMax 逐个"列组"做：第 g 组取每行的 [colBase, colBase+columns) 列，
-     行距 = baseN/8 个 datablock，结果**连续**落在 groupMax[g*MAX_ROWS + r]；
-  6. 第二级用元素级 Max 把各列组折起来（组值之间隔 8 个 float，靠归约 mask 读不到）；
-  7. 每个分片的行最大值再 Max 进行最大值向量（跨 N 取 max，与分片顺序无关）；
-  8. N 尾块：行距 = tailN 的紧凑布局，逐行标量取最大；
-  9. 行和只在 row < validM 上做。
-
-fp32 的 max 是精确操作，所以用 `np.array_equal` 而不是 `isclose`。
+     validM < baseM 时（M 尾块）framework 会多吐 ghost tile，所以 kernel 退回
+     逐 tile 的 Iterate/GetTensorC —— 两者在本模型里都归到"slot 网格"上：
+  2. slot 网格（队友 910C 真机探明）：**slot 步进 = baseM*baseN**，
+     slot 内**行的步进 = 该 tile 自己的 validN**，只写有效行；
+     逐 tile 路径每次写回 slot 0。
+  3. 读回：`DataCopyPad(cUb, cTile[slot*baseM*baseN], blockLen = validM*validN*4)`。
+  4. 归约：整片（validN == baseN）逐行 `ReduceMax(..., count=validN)`，行距 = baseN；
+     N 尾片行距 = validN，走标量逐行读。
+  5. 片间只做 Max（跨 N 取最大，可交换可结合，与顺序无关）。
+  6. 行和只在 row < validM 上做；每 batch 只写一个 float。
 
 反向验证（simulate(variant=...) 故意做错，Oracle 必须报出不一致）：
-  * pad_stride  ：读的时候按**补齐**尺寸 baseM*baseN 找分片（真机是有效尺寸）
-  * tail_pitch  ：尾片行距读成 baseN（真机是 tailN）
-  * no_tail     ：漏掉 N 尾块
-  * sum_all_rows：行和多算到行块末尾的全部 baseM 行
-  * group_fold  ：把第二级的元素级 Max 换成"再调一次归约、mask=64"（读串行）
+  * valid_stride ：slot 偏移按 validM*baseN 算（= 我上一版的错；真机是 baseM*baseN）
+  * tail_pitch   ：N 尾片读时把行距当成 baseN（真机是 validN）
+  * no_tail      ：漏掉 N 尾片
+  * sum_all_rows ：行和多算到行块末尾的全部 baseM 行
 
 用法： python reduce_oracle_gm.py           # 全部通过则退出码 0
 """
@@ -36,8 +33,6 @@ import numpy as np
 
 MAX_BASE_M = 128
 MAX_TILE_N = 256
-READ_TILES = 1
-MAX_ROWS = READ_TILES * MAX_BASE_M
 NEG_INF = np.float32(-3.402823466e38)
 
 
@@ -58,86 +53,60 @@ def simulate(
     b = c.shape[0]
     out = np.zeros(b, dtype=np.float32)
 
-    full_groups = baseN // 64
-    rem_cols = baseN - full_groups * 64
-    group_count = full_groups + (1 if rem_cols else 0)
-    n_full = n // baseN
-    tail_n_true = n - n_full * baseN
+    n_tiles = -(-n // baseN)
 
     for batch in range(b):
         batch_sum = np.float32(0.0)
 
         for row_start in range(0, m, baseM):
             valid_m = min(baseM, m - row_start)
+            strip_at_once = valid_m >= baseM
 
-            # ---- staging：框架按有效尺寸 [validM, baseN] 逐片紧挨着铺 ----
-            write_stride = valid_m * baseN
-            tail_off = n_full * write_stride
-            # 预留 slack：反向变体的错误步进会读到更远的地址，模型里给足空间
-            stage = np.zeros(
-                max(tail_off + valid_m * tail_n_true + baseN,
-                    (n_full + 1) * baseM * baseN + baseN),
-                dtype=np.float32)
-            for t in range(n_full):
-                blk = c[batch, row_start:row_start + valid_m,
-                        t * baseN:(t + 1) * baseN].reshape(-1)
-                stage[t * write_stride:t * write_stride + blk.size] = blk
-            if tail_n_true:
-                blk = c[batch, row_start:row_start + valid_m,
-                        n_full * baseN:n].reshape(-1)
-                stage[tail_off:tail_off + blk.size] = blk
+            # staging：slot 网格（slot 步进 = baseM*baseN，行距 = 该 tile 的 validN）
+            stage = np.zeros((n_tiles + 1) * baseM * baseN, dtype=np.float32)
 
-            # ---- AIV 侧：按自己假定的步进去读 ----
-            read_stride = baseM * baseN if variant == "pad_stride" else write_stride
+
+            def write_slot(t: int) -> None:
+                """把第 t 个 tile 的有效数据写进它该在的 slot（= framework 的连续写）。"""
+                valid_n = min(baseN, n - t * baseN)
+                slot = t if strip_at_once else 0
+                base = slot * baseM * baseN
+                blk = c[batch, row_start:row_start + valid_m,
+                        t * baseN:t * baseN + valid_n]
+                stage[base:base + valid_m * valid_n] = blk.reshape(-1)
+
+
+            if strip_at_once:
+                # 一次性搬出：网格里每个 slot 都就位了才开始读
+                for t in range(n_tiles):
+                    write_slot(t)
 
             row_max = np.full(MAX_BASE_M, NEG_INF, dtype=np.float32)
 
-            t = 0
-            while t < n_full:
-                tiles = min(READ_TILES, n_full - t)
-                rows = tiles * valid_m
-
-                buf = np.zeros((rows, baseN), dtype=np.float32)
-                for j in range(tiles):
-                    off = (t + j) * read_stride
-                    piece = stage[off:off + valid_m * baseN]
-                    buf[j * valid_m:(j + 1) * valid_m, :] = piece.reshape(valid_m, baseN)
-
-                # 第一级：逐个列组，结果连续放在 groupMax[g*MAX_ROWS + r]
-                group_max = np.full(group_count * MAX_ROWS, NEG_INF, dtype=np.float32)
-                for g in range(group_count):
-                    cols = 64 if g < full_groups else rem_cols
-                    col0 = g * 64 if g < full_groups else full_groups * 64
-                    group_max[g * MAX_ROWS:g * MAX_ROWS + rows] = (
-                        buf[:, col0:col0 + cols].max(axis=1))
-
-                # 第二级：元素级 Max 折组
-                if variant == "group_fold":
-                    # 错误做法：再调一次归约、mask=64 —— 连续读 64 个槽，读到别的行
-                    for r in range(rows):
-                        row_pick = group_max[r * group_count: r * group_count + 64].max()
-                        group_max[r] = row_pick
+            for t in range(n_tiles):
+                valid_n = min(baseN, n - t * baseN)
+                if variant == "no_tail" and valid_n < baseN:
+                    continue
+                if not strip_at_once:
+                    # 逐 tile 路径：写一个 slot 立刻读一个（同一个 slot 被反复覆盖）
+                    write_slot(t)
+                slot = t if strip_at_once else 0
+                if variant == "valid_stride":
+                    # 我上一版的错：偏移按有效尺寸算
+                    base = t * valid_m * baseN
                 else:
-                    for g in range(1, group_count):
-                        group_max[:rows] = np.maximum(
-                            group_max[:rows], group_max[g * MAX_ROWS:g * MAX_ROWS + rows])
+                    base = slot * baseM * baseN
 
-                # 跨分片 Max
-                for j in range(tiles):
-                    chunk = group_max[j * valid_m:(j + 1) * valid_m]
-                    row_max[:valid_m] = np.maximum(row_max[:valid_m], chunk)
+                if variant == "tail_pitch" and valid_n < baseN:
+                    # 错：尾片还按 baseN 行距读（会读到下一个 slot 的数据）
+                    raw = stage[base:base + valid_m * baseN]
+                    tile = raw.reshape(valid_m, baseN)[:, :valid_n]
+                else:
+                    # 对：读 valid_m*valid_n 个 float，行距 = valid_n
+                    raw = stage[base:base + valid_m * valid_n]
+                    tile = raw.reshape(valid_m, valid_n)
 
-                t += tiles
-
-            # ---- N 尾块：紧凑布局，行距 = tailN ----
-            tail_n = 0 if variant == "no_tail" else tail_n_true
-            if tail_n:
-                pitch = baseN if variant == "tail_pitch" else tail_n
-                raw = stage[tail_off:tail_off + valid_m * tail_n_true]
-                view = np.zeros(valid_m * pitch, dtype=np.float32)
-                view[:raw.size] = raw
-                row_max[:valid_m] = np.maximum(
-                    row_max[:valid_m], view.reshape(valid_m, pitch)[:, :tail_n].max(axis=1))
+                row_max[:valid_m] = np.maximum(row_max[:valid_m], tile.max(axis=1))
 
             sum_rows = valid_m
             if variant == "sum_all_rows" and row_start + baseM >= m:
@@ -159,15 +128,19 @@ def shapes():
         (1, 128, 512), (1, 128, 500), (1, 300, 1024), (1, 64, 8192),
         (2, 256, 4096), (1, 129, 256), (1, 128, 255), (1, 4000, 260),
         (1, 64, 48), (1, 128, 40), (1, 300, 24), (1, 200, 96), (1, 200, 112),
-        # baseN=256 档（大 baseN 兜底带）与它的尾片
         (1, 128, 256), (1, 256, 256), (1, 300, 256), (1, 200, 300), (1, 128, 512),
+        # 队友 bench 里点名的真机大 shape（尾部/窄 M/窄 N 都在）
+        (1, 2048, 8192), (1, 8192, 8192), (1, 8191, 8191), (1, 33, 8192),
+        (1, 4096, 100), (1, 5000, 5000), (32, 256, 256), (1, 16, 16),
     ]
 
 
 def tile_shape(m: int, n: int) -> tuple[int, int]:
-    baseM = min(MAX_BASE_M, -(-m // 16) * 16)
-    baseN = min(MAX_TILE_N, -(-n // 16) * 16)
-    return baseM, baseN
+    """host 侧 fixM/fixN 的口径：fixM = align16(min(256, m))；fixN = min(tileN, 32768/fixM)。"""
+    fixM = max(16, min(MAX_BASE_M, -(-m // 16) * 16))
+    tileN = min(MAX_TILE_N, -(-n // 16) * 16)
+    fixN = min(tileN, 32768 // fixM)
+    return fixM, max(8, fixN - (fixN % 8))
 
 
 def main() -> int:
@@ -175,7 +148,7 @@ def main() -> int:
     rng = np.random.default_rng(20260925)
     bad = 0
 
-    print("== 正向：simulate 必须与 golden 逐位一致（方阵档 + 基线兜底档）==")
+    print("== 正向：simulate 必须与 golden 逐位一致 ==")
     for b, m, n in shapes():
         baseM, baseN = tile_shape(m, n)
         c = rng.integers(-1000, 1000, size=(b, m, n)).astype(np.float16).astype(np.float32)
@@ -184,40 +157,30 @@ def main() -> int:
         exp = golden(c, m, n)
         got = simulate(c, m, n, baseM, baseN)
         ok = np.array_equal(got, exp)
-        fbM, fbN = 16, min(MAX_TILE_N, -(-n // 16) * 16)
-        ok_fb = np.array_equal(simulate(c, m, n, fbM, fbN), exp)
-        ok = ok and ok_fb
         bad += 0 if ok else 1
         print(
             f"  B={b:2d} M={m:5d} N={n:5d} baseM={baseM:3d} baseN={baseN:3d} "
-            f"nFull={n // baseN:3d} tailN={n % baseN:3d}  兜底16/{fbN:3d}  "
+            f"nTiles={-(-n // baseN):4d} tailN={n % baseN:3d}  "
             f"{'BITWISE-OK' if ok else 'MISMATCH'}"
         )
 
     print("== 反向：故意做错必须被检出 ==")
-    for variant in ("pad_stride", "tail_pitch", "no_tail", "sum_all_rows", "group_fold"):
+    for variant in ("valid_stride", "tail_pitch", "no_tail", "sum_all_rows"):
         caught = 0
         tested = 0
         for b, m, n in shapes():
             baseM, baseN = tile_shape(m, n)
-            if variant == "pad_stride" and (m % baseM == 0 or n // baseN < 2):
+            if variant == "valid_stride" and (m % baseM == 0 or n // baseN < 2):
                 continue
             if variant in ("tail_pitch", "no_tail") and n % baseN == 0:
                 continue
             if variant == "sum_all_rows" and (m % baseM == 0 or m <= baseM):
                 continue
-            if variant == "group_fold" and (baseN // 64) < 1:
-                continue
-            if variant == "group_fold" and n // baseN < 1:
-                continue
             tested += 1
             c = rng.integers(-1000, 1000, size=(b, m, n)).astype(np.float16).astype(np.float32)
-            # 反向验证的数据要"对着变体的错误方向"造，否则会被别的项盖住：
-            #   pad_stride / tail_pitch / group_fold 的错都会**把 0 或邻行/邻片的值捞进来**
-            #   ⇒ 让每个元素都是"随行号、随列号递增的负数"：误读必然得到一个更大的数
-            #     （槽位错位会把后面更大的值捞进来，捞到 slack 则是 0，都比真实值大）；
-            #   no_tail 是**漏掉**尾片（变小）⇒ 让尾片独占最大值且为正。
-            if variant in ("pad_stride", "tail_pitch", "group_fold"):
+            # 数据要"对着变体的错误方向"造：这三种错都会把 0（未写的 slot 区）或邻片数据
+            # 捞进来 ⇒ 让真实行最大值是随行号递增的负数，比 0 小；no_tail 让尾片独占最大。
+            if variant in ("valid_stride", "tail_pitch"):
                 rows_i = np.arange(m, dtype=np.float32)[None, :, None]
                 cols_i = np.arange(n, dtype=np.float32)[None, None, :]
                 c[:] = np.float32(-10000.0) + rows_i + np.float32(0.001) * cols_i

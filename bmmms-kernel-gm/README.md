@@ -174,7 +174,31 @@ staging 是"每 worker 放一个行块的整张 C"，真正的根治手段是**�
 被平台按超时重跑）。这时请给我**崩的那个 case 的 `b/m/n/k`**，或日志里 `<ReplayOnce>` 前后
 那一行 kernel 名 + `Block Dim` —— 有了它就能直接定位到具体形状，而不是再猜。
 
-## 十、文件
+## 十、研读队友 161cf4c 之后（真机 910C 打表版）：本版跟着改了什么
+
+队友在 910C 真机上做了一整轮 perf sprint（`bench/` 20 例 + `sweep.sh` 参数扫描 + 短命 SSH
+隧道 `tools/cann/npu910c-connect.sh`），handoff 里落了三条**探明**的硬事实，其中两条直接
+**推翻了我上一版的假设**：
+
+| 队友探明 | 我上一版的做法 | 本版 |
+| --- | --- | --- |
+| `IterateAll` 条带布局：**slot 步进 = baseM·baseN**，slot 内**行距 = 该 tile 的 validN**，只写有效行 | 读偏移按 `validM·baseN` 算 ✗ **错的** | 改成 `t·baseM·baseN` ✓；行距按 validN ✓ |
+| **singleM < baseM 会多吐一个 ghost tile** | M 尾块也走 IterateAll ✗ | M 尾块退回逐 tile 的 `Iterate()/GetTensorC()` ✓ |
+| 瓶颈 = **单核 MTE2 带宽 ~38GB/s/core**（不是 HBM 总量、不是 K 步延迟） | 花力气把向量归约从"逐行 ReduceMax"改成两级 WholeReduceMax（省指令，但不省搬运） | 退回**基线已验证**的逐行 `ReduceMax` + N 尾标量读 ✓（指令更多但都在噪声里） |
+| 真机 sweep 最优 = `baseM=128, baseN=256`（baseN 还决定 tiler 选的 baseK） | 我把 baseN 上限压到 128 | baseN 上界 256 ✓，阶梯第一档 = `splitN` ✓ |
+
+同时保留我方**结构上更安全**的一点：队友的 Phase 2 是 **Host CPU 归约**
+（`aclrtMemcpy` 回主机 → CPU 里做跨 chunk 的 max 和行和 → `aclrtMemcpy` 回 y）。
+赛题规则原文（我们自己的 `.research` 快照）："**核心计算必须在昇腾 NPU 上由 AscendC 算子完成**；
+把计算转到 Host CPU 或用空 kernel 占位构成违规，**取消当前提交成绩**"。
+本版**整个归约都在同一个 device kernel 内**，不需要第二个 kernel、也不把任何语义搬到主机，
+在这一条上是稳的。
+
+**还从队友那儿学到的**：他们把 case 形状也复现成了本地 20 例（`bench/gen_cases.py`，
+含 `M=8191/N=8191` 全尾、`M=33/N=8192` 窄 M 等极端形状）——这些形状现在也进了我们的
+本地 Oracle（37 组 shape）。
+
+## 十一、文件
 
 | 文件 | 说明 |
 | --- | --- |
