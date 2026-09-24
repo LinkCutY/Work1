@@ -141,10 +141,15 @@ def main() -> int:
         got = simulate(c, m, n, baseM, baseN)
         exp = golden(c, m, n)
         ok = np.array_equal(got, exp)
+        # 兜底档（host 分片阶梯的最后一档 = 基线配置 baseM=16）也必须逐位正确
+        fbM = 16
+        fbN = min(MAX_TILE_N, -(-n // 16) * 16)
+        ok_fb = np.array_equal(simulate(c, m, n, fbM, fbN), exp)
+        ok = ok and ok_fb
         bad += 0 if ok else 1
         print(
             f"  B={b:2d} M={m:5d} N={n:5d} baseM={baseM:3d} baseN={baseN:3d} "
-            f"nFull={n // baseN:3d} tailN={n % baseN:3d}  "
+            f"nFull={n // baseN:3d} tailN={n % baseN:3d}  兜底16/{fbN:3d}  "
             f"{'BITWISE-OK' if ok else 'MISMATCH'}  (y0={got[0]!r} golden={exp[0]!r})"
         )
 

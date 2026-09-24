@@ -17,6 +17,31 @@
 | 本版 | `kernel.asc`（改动集中在 `MatmulMaxKernel` 与 host 的 tiling/workspace） |
 | 提交方式 | 覆盖 `npu-v1/project/kernel.asc`（判题侧唯一 `editable: true` 的文件，其余只读文件未动） |
 
+## 零、上一版为什么被拒（本轮修复）
+
+真机回报：`Profiling rule violated: each iteration must launch exactly 1 kernel.
+Expected 75 launches, got 110.`
+
+**判题硬规则**：一次迭代只能启动 1 个 kernel。而且 —— 这一条是本轮才吃透的 ——
+**任何 abort（host `Fail()` → `status 134`）都会被平台 `<ReplayOnce>` 重放，每次重放多算一次
+launch**。`110 = 75 + 35 = 75 + 7×5`，即约 **7 个 case 每轮都 abort**。根因全在 host 侧两条
+"我方主动 Fail"，与 kernel 本身、与分片策略无关：
+
+| # | 缺陷 | 触发条件 | 修法 |
+| --- | --- | --- | --- |
+| 1 | 分片请求阶梯下限写死 `64`：`for (request = splitN; request >= 64; request -= 64)` | **`n < 64` 的 case 一档都试不成** → `chosenN == 0` → `Fail()` | 阶梯改两档，baseN 一路退到 **8**；`baseM` 档加了**基线(16, splitN) 兜底档** |
+| 2 | 回读校验要求 `baseM >= min(splitM, m)` | tiler 自己把 baseM 收敛到更小值（完全合法）→ `Fail()` | 删掉这一条；只留"UB/GM 缓冲真正的上界 + baseN 8 对齐" |
+| 3 | `aclrtSynchronizeStreamWithTimeout(stream, 3000)` | 任一 case 超过 3s → `CheckAcl` → `Fail()` | 提到 **60s**（这个超时只是本地安全网，判题有自己的 TLE） |
+
+修复后的 abort 面：**基线原有的 7 处 + 2 处构造上不可达的兜底**（`chosenN == 0`、
+回读越界）—— 因为兜底档就是真机 15/15 那版用的 `(16, splitN)`，一定拿得到 tiling。
+本地新增门禁 `tools/launch_check.py` 守"启动点互斥、无同块并联启动"（本版 6 处启动，
+与基线同为互斥的 2 小 + 4 转置分支）。
+
+> 为什么"分片请求阶梯"不会再把合法情况变成 abort：kernel 侧的行块步长就是 `baseM`，
+> `validM = min(baseM, m - rowStart)` 恒 ≤ `baseM` ⇒ `mBlocks` 恒为 1，所以
+> **任何** `baseM ≤ 128 / baseN ≤ 256` 的回读值都是安全的几何 —— 退让只是少赚。
+
 ## 一、为什么"穿 GM"绕不开
 
 `910D_knowledge_extra/220x到351x架构变更.md:120-165` 把「**新增 L0C Buffer 到 UB 的
@@ -91,8 +116,9 @@ N 尾块（`n % baseN != 0`）在两侧都是额外 1 写 + 1 读。
 
 | 门禁 | 结果 |
 | --- | --- |
+| **`tools/launch_check.py`（判题硬规则：iter 内单 kernel）** | **通过**：6 处启动点全在互斥分支、无同块并联；并列出全部 `Fail()` 调用点供复核 |
 | `tools/syntax_check.py`（g++ `-fsyntax-only` + 手抄 8.5 文档签名的 stubs） | 基线 ok / 本版 **ok**，本版比基线**少**一个 warning |
-| `tools/reduce_oracle_gm.py`（搬运/归约顺序的离线逐位复算） | **20 组 shape**（含 `baseN=256`、`tailN` 从 0 到 255、`n<baseN`、`m%baseM!=0`、`n=8192`）× `np.array_equal` **全部逐位一致** |
+| `tools/reduce_oracle_gm.py`（搬运/归约顺序的离线逐位复算） | **20 组 shape × 两档配置**（激进 `128×256` 与**兜底 `16×…`**）× `np.array_equal` **全部逐位一致**（含 `baseN=256`、`tailN` 0→255、`n<baseN`、`m%baseM!=0`、`n=8192`） |
 | 同上，**反向验证（4 个变体，确定性构造）** | 尾块混进归并 10/10、行和多算残留 8/8、关掉 AtomicMax 9/9、漏掉尾块 10/10 —— **全部被检出** |
 | `tools/api_delta.py`（相对 15/15 基线多用了哪些 API） | 只多 3 个：`WholeReduceMax`、`SetAtomicNone`、`HardEvent::V_MTE2`（外加 `GetTensorC` 的 `enAtomic=2` 取值）；少了 `ReduceMax` |
 | 容量算术 | 见第三节表格（L0C 100%、UB 68%、GM 槽位 = 3×blocks×256KB，blocks=24 时 19MB） |
@@ -100,8 +126,11 @@ N 尾块（`n % baseN != 0`）在两侧都是额外 1 写 + 1 读。
 **没有做（本机做不到）**：真机编译、上板精度、真机用时、AtomicMax 的实际硬件行为、
 tiler 到底会不会接受 256 列的分片。
 
-## 六、上板必查（按优先级，详细版在 `kernel.asc` 末尾 VERIFY，共 9 条）
+## 六、上板必查（按优先级，详细版在 `kernel.asc` 末尾 VERIFY，共 10 条）
 
+0. **先看日志里还有没有 `<ReplayOnce>` / `status 134` / launch 数超标** —— 本轮修的就是
+   这条：任何 abort 都会被重放并多算一个 launch。若再次出现，把新的差值（`got - expected`）
+   告我，`差值 / 迭代次数 = 出问题的 case 数`，能直接锁定是哪些形状。
 1. **Fixpipe 的 AtomicMax 是否生效**（本版唯一没有真机先例的组合：`enAtomic=2` +
    `enSequentialWrite=true`）。失败特征：**所有 case 结果偏小**（只剩最后一个 N 分片）。
 2. **打印回读的 `baseM/baseN/dbL0C`**：
@@ -131,11 +160,13 @@ tiler 到底会不会接受 256 列的分片。
 | --- | --- |
 | **`kernel.asc`** | ★ 交付物：覆盖 `npu-v1/project/kernel.asc` 提交 |
 | `teammate-latest.asc` | 基线原文（真机 15/15）—— 退路 |
+| `tools/launch_check.py` | **判题硬规则门禁**：启动点互斥、无同块并联、列出全部 `Fail()` 复核点 |
 | `tools/syntax_check.py` + `tools/stubs/` | 本地语法门禁（g++ `-fsyntax-only`） |
-| `tools/reduce_oracle_gm.py` | 离线逐位复算 + 反向验证 |
+| `tools/reduce_oracle_gm.py` | 离线逐位复算 + 反向验证（含兜底档配置） |
 | `tools/api_delta.py` | 相对基线的 API 差集（列出无真机证据的新用法） |
 
 ```bash
+python tools/launch_check.py kernel.asc      # 判题硬规则（必须 0 退出）
 python tools/syntax_check.py kernel.asc      # 语法门禁
 python tools/reduce_oracle_gm.py             # 归约逻辑逐位复算（退出码 0 = 全过）
 python tools/api_delta.py                    # 新 API 差集
