@@ -31,7 +31,7 @@ import sys
 import numpy as np
 
 MAX_BASE_M = 128
-MAX_TILE_N = 128
+MAX_TILE_N = 256
 NEG_INF = np.float32(-3.402823466e38)
 
 
@@ -121,6 +121,9 @@ def shapes():
         (1, 16, 16), (1, 128, 128), (1, 129, 129), (1, 200, 300),
         (1, 64, 1000), (1, 1000, 64), (4, 100, 2000), (1, 1, 8192),
         (3, 300, 300), (1, 128, 4096), (2, 257, 1000), (1, 17, 65),
+        # baseN=256 档（L0C 满存）与其各种尾块
+        (1, 128, 512), (1, 128, 500), (1, 300, 1024), (1, 64, 8192),
+        (2, 256, 4096), (1, 129, 256), (1, 128, 255), (1, 4000, 260),
     ]
 
 
@@ -165,6 +168,9 @@ def main() -> int:
             if variant == "no_tail" and n % baseN:
                 # 让行最大值只出现在 N 尾块里 —— 漏掉尾块必然被检出（确定性反向验证）
                 c[:, :, (n // baseN) * baseN :] = np.float32(10000.0)
+            if variant == "last_wins":
+                # 让行最大值只出现在**第 0 个** N 分片里 —— 只留最后一片必然被检出
+                c[:, :, :baseN] = np.float32(10000.0)
             got = simulate(c, m, n, baseM, baseN, variant=variant)
             # 变体本身会溢出（它就是要算错），屏蔽 numpy 的溢出告警
             with np.errstate(over="ignore"):
