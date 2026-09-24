@@ -124,7 +124,29 @@ A2/A3 支持，示例就是 `REGIST_MATMUL_OBJ + SetTensorA/B + IterateAll(gm_c)
 4. 打印 `baseM/baseN/depthA1/depthB1/stepN`，确认框架把 512KiB L1 用起来了。
 5. UB 136KB / 192KB、staging 分配成功与否。
 
-## 八、文件
+## 八、第 8 个点 RE（status 134）的诊断与本版修复
+
+真机日志（profiling 阶段）：
+`MatmulMaxKernel<bf16, true, true>` 的某个用例报
+`<ReplayOnce> Kernel run on device 0 No. 1 time failed.` → `Child process exited with status 134`
+→ `Get profiling data failed.`。同一模板**前面 Block Dim 4 的用例跑完 5 次都正常**，
+崩的那次是 **Block Dim 9** 的另一个 shape ⇒ 是**随 shape 变化**的失败，不是模板本身。
+
+`134 = SIGABRT` 只可能来自 host 侧 abort。v5 相比基线新增的、随 shape 变化的 abort 路径有三条，
+本版把最可能的两条堵死：
+
+| # | 路径 | 为什么随 shape 变化 | 修法 |
+| --- | --- | --- | --- |
+| 1 | **staging 的 `aclrtMalloc` 失败** → `CheckAcl` → `abort` | v5 的 workspace 是 `min(b,2·blocks) × baseM × n × 4B`：n 大、b 大时要到几百 MB（基线只有 ~1.2MB，**大了两个数量级**） | 总占用按 **64MB 预算收缩 `blocks`**；`aclrtMalloc` 失败**继续砍 `blocks` 重试**，只剩 1 块还失败才 Fail |
+| 2 | **连续写越过 staging 尾部** → 设备越界 → ACL 报错 → `CheckAcl` → `abort` | 只有 `m % baseM != 0` 的用例才会让"补齐尺寸步进"的写超出（`validM < baseM`） | staging 每块多留**一个分片**余量：`baseM*(n+baseN)`；并把非活动 worker 的槽位下标**夹到 0**，保证任何 worker 算出的地址都合法 |
+| 3 | 分片阶梯全败 → `Fail()` | 需要 tiler 连 `(16, 128/64/…/8)` 全拒 | 保留（构造上几乎不可达） |
+
+**下一步的判定方法**（若还崩）：把崩的那个 case 的 `b/m/n/k` 发我。因为
+staging 是"每 worker 放一个行块的整张 C"，真正的根治手段是**按 N 窗口分块**
+（这样每块只放 `baseM × N窗口`）—— 但 B 只有在 `TRANSPOSE_B=true` 时列窗口才是连续地址，
+所以那是个带条件分支的设计，我不想在没拿到 shape 前先猜。
+
+## 九、文件
 
 | 文件 | 说明 |
 | --- | --- |
