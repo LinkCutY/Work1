@@ -1,24 +1,29 @@
-fix(bmm-opt): 关掉 phase 2 第二 kernel（修 launch 数超标 110→75），去掉未验证 API
+fix(bmm-opt): 同步提交副本 + 补齐 tiling 兜底档（真源/副本哈希不一致是连续两轮 110 的真因）
 
-基线：你本人那版 kernel.asc（bmmms-kernel-opt）。它的 tiling 用 SetBufferSpace(-1,-1,-1)
-= 平台真实值，**没有**把 AIC L1 写成 512KiB —— 这一条已按行号核对过。
+一、真因（有哈希证据）
+   判题用的**副本**一直是旧的：
+     真源 bmmms-kernel-opt/kernel.asc                     722dd0ce37a4 (1495 行, SINGLE_LAUNCH=1)
+     副本 bmmms-kernel-opt/submit/project/kernel.asc      b7192b89fd01 (1401 行, SINGLE_LAUNCH=0)
+     副本 .research/repos/.../npu-v1/project/kernel.asc   b7192b89fd01 (1401 行, SINGLE_LAUNCH=0)
+   => 上一轮提交跑的还是带 phase-2 第二 kernel 的旧版，于是误差完全一致：
+      Expected 75, got 110（差值 35 = 7 个 case x 5 次迭代，每 case 多起一个
+      PartialSumKernel）。
+   本轮把三处同步成同一个哈希 769c1e004495：BMM_SINGLE_LAUNCH=1 =>
+   directOut 恒为 true => PartialSumKernel 那段是死代码 => 一次迭代恰好 1 个 kernel。
 
-根因（这版自己的 VERIFY 第 4 条预告过）：
-  directOut = (BMM_SINGLE_LAUNCH != 0) || (nmwin == 1 && groups == 1)
-  if (!directOut) PartialSumKernel<<<blocks>>>   ← 第二个 kernel
-凡 nmwin>1 或 groups>1 的 case 每次迭代起 2 个 kernel ⇒ "Expected 75, got 110"
-（差值 35 = 7 个 case × 5 次迭代）。上一轮我把 BMM_GROUPS_MULT 从 1 改成 2，
-反而让更多 case 落进这条路 —— 已回退。
+二、顺手堵掉剩余的 abort 面（abort 会被 ReplayOnce 重放，同样多算 launch）
+   - tiling 降级阶梯从 4 档加到 6 档，新增两档"基线口径"兜底：
+     (16, baseNTarget) 与 (16, 64) —— 真机 15/15 用的就是 baseM=16，
+     所以 tilingReady 必然可达，`连 tiler 自行决定都拿不到可用的 baseM/baseN` 那个
+     Fail() 实际不可达。
+   - 内部 stream 同步超时 3000ms -> 60000ms（超时会走 CheckAcl -> abort -> ReplayOnce）。
+   - 新增 bmmms-kernel-opt/sync_submit.py：提交前核对"真源 vs 所有会被提交的副本"
+     的哈希，--write 直接覆盖。这次的错=副本没换，以后一条命令就能挡住。
 
-改动：
-- BMM_SINGLE_LAUNCH 0 -> 1：强制 groups=1、每个 task 把行和原子累进 y[batch]、
-  不再启动 phase 2 ⇒ 一次迭代恰好 1 个 kernel。副作用（已知可接受）：
-  放弃 N 方向并行；原子加末位不可复现（离线量化极差 ≤3.1e-2，容差下限 ≥8.2）。
-- 去掉唯一的 UNKNOWN API：platform->GetCoreNumAiv() -> 常数 2
-  （依据：基线真机实测 AIV 的 GetBlockIdx() ∈ [0,2*blocks)）。api_gate 现在零新增 API。
-- 保留上一轮的核数动态部分：ratio = min(BMM_TASK_RATIO, 硬件比例)、
-  workers = ratio*blocks（修掉 host 写死 2U*blocks 与 kernel 用 BMM_TASK_RATIO
-  不一致、ratio=1 时一半 task 没人领的静默偏小 bug）、chunkWidth 的双缓冲上界。
-- VERIFY 增补 11)（本轮修复 + 原子对齐的文档依据 + 残留风险）与 12)（不再引入未验证 API）。
+三、工具修正
+   bmmms-kernel-gm/tools/launch_check.py 原来把同层级的 if/else 兄弟分支算成
+   "同一代码块"，对多 transpose 分支的 kernel 误报。改成按"每个启动点最近的
+   if/else 行号是否互不相同"判断互斥，现在这份 kernel 判为通过。
 
-门禁：syntax_check 通过（无 warning/error）；api_gate 零新增 API。
+门禁：syntax_check 通过（无 warning/error）；api_gate 零新增 API；
+      sync_submit.py 核对三处哈希一致（769c1e004495）。

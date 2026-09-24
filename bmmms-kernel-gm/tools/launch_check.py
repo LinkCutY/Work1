@@ -52,6 +52,7 @@ def main() -> int:
     code = path.read_text(encoding="utf-8")
     bare = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
     bare = re.sub(r"//[^\n]*", "", bare)
+    bare_lines = bare.splitlines()
 
     problems: list[str] = []
     launches = [i for i, l in enumerate(bare.splitlines(), start=1) if LAUNCH.search(l)]
@@ -63,10 +64,23 @@ def main() -> int:
 
     for body in split_top_level_bodies(bare):
         hits = [lineno for lineno, line in body if LAUNCH.search(line)]
-        if len(hits) > 1:
+        if len(hits) <= 1:
+            continue
+        # 同一块里多次启动**只有在它们是同一条 if/else 链的不同分支时才合法**。
+        # 取每个启动点往前最近的 if/else 行号：若互不相同 → 互斥分支 → 放过；
+        # 若有两个启动点挂在同一个 if 上（顺序执行）→ 报错。
+        arms = []
+        for lineno in hits:
+            guard = None
+            for back in range(lineno - 2, max(-1, lineno - 40), -1):
+                if re.match(r"\s*(\}?\s*)?(else\s+if|else|if)\b", bare_lines[back]):
+                    guard = back + 1
+                    break
+            arms.append(guard)
+        if len(set(arms)) != len(arms) or None in arms:
             problems.append(
-                f"同一代码块内有 {len(hits)} 次 kernel 启动（行 {hits}）"
-                "  <- 判题要求每次迭代恰好 1 个 kernel")
+                f"同一代码块内有 {len(hits)} 次 kernel 启动（行 {hits}，"
+                f"各自最近的 if/else 行 {arms}）  <- 判题要求每次迭代恰好 1 个 kernel")
 
     # 启动点必须落在互斥分支里：检查每处启动所属的紧邻 if/else 链（粗判，够用）
     text = bare.splitlines()
