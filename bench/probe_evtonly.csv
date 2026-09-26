@@ -1,0 +1,3 @@
+# soc=Ascend910_9362 cube=20 vec=40
+case,B,M,N,K,dtype,tx1,tx2,min_ms,med_ms,pass,maxdiff,deterministic
+case03,4,128,512,256,2,1,1,1.729,1.729,PASS,0.000244,1,96422ed9aabf15a4
